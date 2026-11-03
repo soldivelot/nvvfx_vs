@@ -31,27 +31,25 @@ pip install nvidia-vfx numpy torch
 
 ## Installation
 
-Place `nvvfx_vs.py` in your VapourSynth scripts directory:
-
-- Windows: `VapourSynth\Lib\site-packages\vapoursynth\scripts\`
-- Linux: `~/.local/lib/python3.x/site-packages/vapoursynth/scripts/`
+Place `nvvfx_vs.py` in your VapourSynth scripts directory
 
 ## Usage
 
 ```python
 import vapoursynth as vs
 core = vs.core
+from nvvfx_vs import vfx_upscale, vfx_interpolate, vfx_truehdr
 
-clip = core.ffms2.Source("input.mp4")
+clip = core.bs.VideoSource("foo.mp4")
 
 # Upscale 2x with ULTRA quality
-clip = core.nvvfx_vs.vfx_upscale(clip, factor=2, quality="ULTRA")
+clip = vfx_upscale(clip, factor=2, quality="ULTRA")
 
 # Interpolate to 2x frame rate (e.g. 24fps -> 48fps)
-clip = core.nvvfx_vs.vfx_interpolate(clip, factor=2, mode="HIGH")
+clip = vfx_interpolate(clip, factor=2, mode="HIGH")
 
 # Convert SDR to HDR10
-clip = core.nvvfx_vs.vfx_truehdr(clip, luminance=1000)
+clip = vfx_truehdr(clip, luminance=1000)
 
 clip.set_output()
 ```
