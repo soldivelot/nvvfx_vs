@@ -10,7 +10,7 @@ import numpy as np
 
 core = vs.core
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["vfx_upscale", "vfx_interpolate", "vfx_truehdr", "to_rgbs"]
 
 try:
@@ -22,6 +22,7 @@ except ImportError:
 
 _EFFECTS: dict = {}
 _EFFECT_LOCK = threading.Lock()
+_local = threading.local()
 
 
 def _require_nvvfx() -> None:
@@ -64,18 +65,50 @@ def _get_effect(cls, key, factory):
         return eff
 
 
-def _plane_np(frame, plane: int, dtype, itemsize: int) -> np.ndarray:
+_FORMATS: dict = {}
+
+
+def _get_formats():
+    if not _FORMATS:
+        _FORMATS["rgbs"] = core.query_video_format(vs.RGB, vs.FLOAT, 32, 0, 0)
+        _FORMATS["rgb30"] = core.query_video_format(vs.RGB, vs.INTEGER, 10, 0, 0)
+    return _FORMATS["rgbs"], _FORMATS["rgb30"]
+
+
+class _Buf:
+    __slots__ = ("dev", "h", "w", "n_in", "cuda_in", "stage", "stage2")
+
+    def __init__(self, torch, dev, h, w, n_in):
+        self.dev = dev
+        self.h, self.w = h, w
+        self.n_in = n_in
+        self.cuda_in = [torch.empty(3, h, w, dtype=torch.float32, device=dev)
+                        for _ in range(n_in)]
+        self.stage = np.empty((3, h, w), dtype=np.float32)
+        self.stage2 = np.empty((3, h, w), dtype=np.float32) if n_in == 2 else None
+
+
+def _get_buf(torch, dev, h, w, n_in):
+    key = (dev, h, w, n_in)
+    b = getattr(_local, "buf", None)
+    if b is None or (b.dev, b.h, b.w, b.n_in) != key:
+        b = _Buf(torch, dev, h, w, n_in)
+        _local.buf = b
+    return b
+
+
+def _read_into(stage, frame):
     w, h = frame.width, frame.height
-    stride = frame.get_stride(plane)
-    addr = frame.get_read_ptr(plane).value
-    buf = (ctypes.c_uint8 * (h * stride)).from_address(addr)
-    raw = np.ctypeslib.as_array(buf).reshape(h, stride)
-    row_bytes = w * itemsize
-    out = raw[:, :row_bytes].reshape(h, w, itemsize).view(dtype=dtype).reshape(h, w)
-    return out.copy()
+    for p in range(3):
+        stride = frame.get_stride(p)
+        addr = frame.get_read_ptr(p).value
+        buf = (ctypes.c_uint8 * (h * stride)).from_address(addr)
+        raw = np.ctypeslib.as_array(buf).reshape(h, stride)
+        plane_view = raw[:, :w * 4].reshape(h, w, 4).view(np.float32).reshape(h, w)
+        np.copyto(stage[p], plane_view)
 
 
-def _write_plane(frame, plane: int, data: np.ndarray) -> None:
+def _write_plane(frame, plane, data):
     h, w = data.shape
     itemsize = data.dtype.itemsize
     stride = frame.get_stride(plane)
@@ -87,26 +120,12 @@ def _write_plane(frame, plane: int, data: np.ndarray) -> None:
     raw[:, :row_bytes] = flat
 
 
-_FORMATS: dict = {}
-
-
-def _get_formats():
-    if not _FORMATS:
-        _FORMATS["rgbs"] = core.query_video_format(vs.RGB, vs.FLOAT, 32, 0, 0)
-        _FORMATS["rgb30"] = core.query_video_format(vs.RGB, vs.INTEGER, 10, 0, 0)
-    return _FORMATS["rgbs"], _FORMATS["rgb30"]
-
-
-def _frame_to_rgb_numpy(f) -> np.ndarray:
-    return np.stack([_plane_np(f, p, np.float32, 4) for p in range(3)], axis=0)
-
-
-def _write_rgb_numpy(dst, rgb: np.ndarray) -> None:
+def _write_rgb_numpy(dst, rgb):
     for p in range(3):
         _write_plane(dst, p, rgb[p])
 
 
-def _frame_at(f, idx: int):
+def _frame_at(f, idx):
     if isinstance(f, (list, tuple)):
         return f[idx]
     return f
@@ -122,7 +141,7 @@ def _ev_debug(fn):
     return wrapper
 
 
-def _run_clone(torch, dev, run_call):
+def _run_and_clone(torch, dev, run_call):
     stream = torch.cuda.current_stream(device=dev)
     result = run_call(stream.cuda_stream)
     torch.cuda.synchronize(device=dev)
@@ -131,7 +150,7 @@ def _run_clone(torch, dev, run_call):
     return out
 
 
-def to_rgbs(clip, matrix_in_s: str = "709", range_in_s: str = "limited"):
+def to_rgbs(clip, matrix_in_s="709", range_in_s="limited"):
     fmt = clip.format
     if fmt is None:
         raise vs.Error("nvvfx_vs: variable-format input is not supported")
@@ -186,13 +205,14 @@ def vfx_upscale(clip, width=None, height=None, factor=None,
     dev = f"cuda:{device}"
 
     def ev(n, f):
-        rgb = _frame_to_rgb_numpy(_frame_at(f, 0))
-        t = torch.from_numpy(np.ascontiguousarray(rgb)).to(dev)
+        buf = _get_buf(torch, dev, H, W, 1)
+        _read_into(buf.stage, _frame_at(f, 0))
+        buf.cuda_in[0].copy_(torch.from_numpy(buf.stage), non_blocking=True)
         with _EFFECT_LOCK:
-            out_img = _run_clone(torch, dev,
-                lambda sp: sr.run(t, stream_ptr=sp, non_blocking=False))
+            out_img = _run_and_clone(torch, dev,
+                lambda sp: sr.run(buf.cuda_in[0], stream_ptr=sp, non_blocking=False))
         arr = out_img.detach().cpu().numpy()
-        dst = core.create_video_frame(rgbs.id, arr.shape[2], arr.shape[1])
+        dst = core.create_video_frame(rgbs.id, int(width), int(height))
         _write_rgb_numpy(dst, arr)
         return dst
 
@@ -231,6 +251,7 @@ def vfx_interpolate(clip, factor=2, mode="MEDIUM", auto_shot_change=True, device
     torch = _require_torch()
     rgbs, _ = _get_formats()
     dev = f"cuda:{device}"
+    W, H = src.width, src.height
 
     out_len = (L - 1) * factor + 1
 
@@ -248,16 +269,17 @@ def vfx_interpolate(clip, factor=2, mode="MEDIUM", auto_shot_change=True, device
         j = n % factor
         if j == 0:
             return _frame_at(f, 0).copy()
-        a = _frame_to_rgb_numpy(_frame_at(f, 0))
-        b = _frame_to_rgb_numpy(_frame_at(f, 1))
-        ta = torch.from_numpy(np.ascontiguousarray(a)).to(dev)
-        tb = torch.from_numpy(np.ascontiguousarray(b)).to(dev)
+        buf = _get_buf(torch, dev, H, W, 2)
+        _read_into(buf.stage, _frame_at(f, 0))
+        _read_into(buf.stage2, _frame_at(f, 1))
+        buf.cuda_in[0].copy_(torch.from_numpy(buf.stage), non_blocking=True)
+        buf.cuda_in[1].copy_(torch.from_numpy(buf.stage2), non_blocking=True)
         with _EFFECT_LOCK:
-            out_img = _run_clone(torch, dev,
-                lambda sp: vfg.run(ta, tb, frame_index=j,
-                                   stream_ptr=sp, non_blocking=False))
+            out_img = _run_and_clone(torch, dev,
+                lambda sp: vfg.run(buf.cuda_in[0], buf.cuda_in[1],
+                                   frame_index=j, stream_ptr=sp, non_blocking=False))
         arr = out_img.detach().cpu().numpy()
-        dst = core.create_video_frame(rgbs.id, arr.shape[2], arr.shape[1])
+        dst = core.create_video_frame(rgbs.id, W, H)
         _write_rgb_numpy(dst, arr)
         return dst
 
@@ -272,6 +294,7 @@ def vfx_truehdr(clip, contrast=100, saturation=100, middle_gray=50,
                 luminance=650, debanding_off=0, device=0, set_hdr_props=True):
     _require_nvvfx()
     src = to_rgbs(clip)
+    W, H = src.width, src.height
 
     key = ("thdr", device, int(contrast), int(saturation), int(middle_gray),
            int(luminance), int(debanding_off))
@@ -287,17 +310,18 @@ def vfx_truehdr(clip, contrast=100, saturation=100, middle_gray=50,
     dev = f"cuda:{device}"
 
     def ev(n, f):
-        rgb = _frame_to_rgb_numpy(_frame_at(f, 0))
-        t = torch.from_numpy(np.ascontiguousarray(rgb)).to(dev)
+        buf = _get_buf(torch, dev, H, W, 1)
+        _read_into(buf.stage, _frame_at(f, 0))
+        buf.cuda_in[0].copy_(torch.from_numpy(buf.stage), non_blocking=True)
         with _EFFECT_LOCK:
-            packed = _run_clone(torch, dev,
-                lambda sp: thdr.run(t, stream_ptr=sp, non_blocking=False))
+            packed = _run_and_clone(torch, dev,
+                lambda sp: thdr.run(buf.cuda_in[0], stream_ptr=sp, non_blocking=False))
         px = packed.detach().cpu().numpy().astype(np.uint32)
         r = (px & 0x3FF).astype(np.uint16)
         g = ((px >> 10) & 0x3FF).astype(np.uint16)
         b = ((px >> 20) & 0x3FF).astype(np.uint16)
 
-        dst = core.create_video_frame(rgb30.id, src.width, src.height)
+        dst = core.create_video_frame(rgb30.id, W, H)
         _write_rgb_numpy(dst, np.stack([r, g, b], axis=0))
         if set_hdr_props:
             dst.props["_Primaries"] = int(vs.PRIMARIES_BT2020)
