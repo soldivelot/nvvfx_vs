@@ -91,12 +91,6 @@ Convert SDR video to HDR10 (BT.2020 primaries, ST.2084 PQ transfer).
 
 Output format is RGB30 (10-bit integer RGB packed as R10G10B10A2).
 
-## Notes
-
-- Effect instances are cached by parameters to avoid reloading AI models.
-- A global lock serializes GPU inference since nvvfx objects are not thread-safe for concurrent `run()` calls.
-- Performance is currently frame-by-frame synchronous (upload -> infer -> download). Suitable for prototyping and medium resolutions; 4K long-form content would benefit from an async/batched pipeline.
-
 ## License
 
 MIT
